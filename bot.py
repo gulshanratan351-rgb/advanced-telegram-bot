@@ -1,25 +1,13 @@
 import os
-import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional
-import re
-from io import BytesIO
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, InputMediaVideo, ChatPermissions
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, JobQueue
-)
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from pymongo import MongoClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
-import requests
 
 # Load environment variables
 load_dotenv()
@@ -34,126 +22,93 @@ logger = logging.getLogger(__name__)
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 MONGO_URI = os.getenv('MONGO_URI')
-ADMIN_IDS = [int(id) for id in os.getenv('ADMIN_IDS', '').split(',') if id]
-PREMIUM_FRAMES = {
-    'gold': {'color': '#FFD700', 'width': 5},
-    'silver': {'color': '#C0C0C0', 'width': 5},
-    'bronze': {'color': '#CD7F32', 'width': 5},
-    'rainbow': {'color': 'rainbow', 'width': 5}
-}
+ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
 
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN not set!")
+    exit(1)
+
+if not MONGO_URI:
+    logger.error("MONGO_URI not set!")
+    exit(1)
+
+# Database Class
 class Database:
     def __init__(self):
-        self.client = MongoClient(MONGO_URI)
-        self.db = self.client.telegram_bot
-        
-        # Collections
-        self.settings = self.db.settings
-        self.scheduled_posts = self.db.scheduled_posts
-        self.auto_forward = self.db.auto_forward
-        self.users = self.db.users
-        
-        # Initialize default settings
-        self._init_defaults()
+        try:
+            self.client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            self.db = self.client.telegram_bot
+            self.users = self.db.users
+            self.settings = self.db.settings
+            self.scheduled_posts = self.db.scheduled_posts
+            self.auto_forward = self.db.auto_forward
+            
+            # Test connection
+            self.client.admin.command('ping')
+            logger.info("MongoDB connected successfully!")
+            
+            # Initialize default settings
+            if not self.settings.find_one({'_id': 'global'}):
+                self.settings.insert_one({
+                    '_id': 'global',
+                    'header': '',
+                    'footer': '',
+                    'premium_frame': 'gold',
+                    'delete_service_msgs': True,
+                    'auto_approve_requests': False
+                })
+        except Exception as e:
+            logger.error(f"MongoDB connection failed: {e}")
+            raise
     
-    def _init_defaults(self):
-        # Default bot settings
-        if not self.settings.find_one({'_id': 'global'}):
-            self.settings.insert_one({
-                '_id': 'global',
-                'header': '',
-                'footer': '',
-                'premium_frame': 'gold',
-                'delete_service_msgs': True,
-                'auto_approve_requests': False
-            })
-    
-    def get_setting(self, key: str, default=None):
+    def get_setting(self, key, default=None):
         setting = self.settings.find_one({'_id': 'global'})
         return setting.get(key, default) if setting else default
     
-    def update_setting(self, key: str, value):
-        self.settings.update_one(
-            {'_id': 'global'},
-            {'$set': {key: value}},
+    def update_setting(self, key, value):
+        self.settings.update_one({'_id': 'global'}, {'$set': {key: value}}, upsert=True)
+    
+    def add_user(self, user_id, username=None, first_name=None):
+        self.users.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'username': username,
+                'first_name': first_name,
+                'last_active': datetime.now()
+            }},
             upsert=True
         )
     
-    def add_scheduled_post(self, post_data: dict):
+    def get_user_count(self):
+        return self.users.count_documents({})
+    
+    def add_scheduled_post(self, post_data):
         return self.scheduled_posts.insert_one(post_data)
     
     def get_scheduled_posts(self, status='pending'):
         return list(self.scheduled_posts.find({'status': status}))
     
-    def update_scheduled_post(self, post_id, update_data):
-        self.scheduled_posts.update_one(
-            {'_id': post_id},
-            {'$set': update_data}
-        )
-    
-    def add_auto_forward(self, config: dict):
-        self.auto_forward.insert_one(config)
+    def add_auto_forward(self, config):
+        return self.auto_forward.insert_one(config)
     
     def get_auto_forward_configs(self):
         return list(self.auto_forward.find({'active': True}))
-    
-    def add_user(self, user_id: int, username: str = None):
-        self.users.update_one(
-            {'user_id': user_id},
-            {'$set': {'username': username, 'last_active': datetime.now()}},
-            upsert=True
-        )
 
-db = Database()
+# Initialize database
+try:
+    db = Database()
+except Exception as e:
+    logger.error(f"Failed to initialize database: {e}")
+    db = None
 
-class PremiumEffects:
-    @staticmethod
-    def add_frame_to_image(image_bytes: bytes, frame_type: str = 'gold') -> BytesIO:
-        """Add premium frame to image"""
-        image = Image.open(BytesIO(image_bytes))
-        
-        if frame_type == 'rainbow':
-            # Create rainbow gradient frame
-            draw = ImageDraw.Draw(image)
-            width, height = image.size
-            frame_width = 10
-            
-            colors = ['#FF0000', '#FF7F00', '#FFFF00', '#00FF00', '#0000FF', '#4B0082', '#9400D3']
-            segment = width // len(colors)
-            
-            for i, color in enumerate(colors):
-                x1 = i * segment
-                x2 = (i + 1) * segment
-                draw.rectangle([x1, 0, x2, frame_width], fill=color)
-                draw.rectangle([x1, height-frame_width, x2, height], fill=color)
-                draw.rectangle([0, x1, frame_width, x2], fill=color)
-                draw.rectangle([width-frame_width, x1, width, x2], fill=color)
-        else:
-            # Regular colored frame
-            frame_config = PREMIUM_FRAMES.get(frame_type, PREMIUM_FRAMES['gold'])
-            draw = ImageDraw.Draw(image)
-            width, height = image.size
-            frame_width = frame_config['width']
-            
-            for i in range(frame_width):
-                draw.rectangle(
-                    [i, i, width-1-i, height-1-i],
-                    outline=frame_config['color']
-                )
-        
-        output = BytesIO()
-        image.save(output, format='PNG')
-        output.seek(0)
-        return output
-
+# Message Modifier Class
 class MessageModifier:
     @staticmethod
-    def add_header_footer(text: str, header: str = None, footer: str = None) -> str:
-        """Add header and footer to message"""
+    def add_header_footer(text, header=None, footer=None):
         if not header:
-            header = db.get_setting('header', '')
+            header = db.get_setting('header', '') if db else ''
         if not footer:
-            footer = db.get_setting('footer', '')
+            footer = db.get_setting('footer', '') if db else ''
         
         modified_text = ""
         if header:
@@ -163,203 +118,17 @@ class MessageModifier:
             modified_text += f"\n\n{footer}"
         
         return modified_text
-    
-    @staticmethod
-    def format_with_buttons(text: str, buttons: List[List[dict]] = None) -> tuple:
-        """Add inline buttons to message"""
-        keyboard = []
-        if buttons:
-            for row in buttons:
-                keyboard_row = []
-                for btn in row:
-                    if btn.get('url'):
-                        keyboard_row.append(InlineKeyboardButton(btn['text'], url=btn['url']))
-                    else:
-                        keyboard_row.append(InlineKeyboardButton(btn['text'], callback_data=btn.get('callback', 'none')))
-                keyboard.append(keyboard_row)
-        
-        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-        return text, reply_markup
-    
-    @staticmethod
-    def create_spoiler(text: str) -> str:
-        """Create spoiler tag for text"""
-        return f"<span class=\"tg-spoiler\">{text}</span>"
-    
-    @staticmethod
-    def hide_image_as_spoiler(photo_file_id: str) -> dict:
-        """Mark image as spoiler"""
-        return {'photo': photo_file_id, 'has_spoiler': True}
 
-class AutoForwardManager:
-    def __init__(self, application: Application):
-        self.application = application
-        
-    async def start_forwarding(self):
-        """Start monitoring source channels for auto-forward"""
-        async def check_and_forward():
-            configs = db.get_auto_forward_configs()
-            for config in configs:
-                # Get last processed message ID
-                last_msg_id = config.get('last_processed_id', 0)
-                
-                try:
-                    # Get recent messages from source chat
-                    async for message in self.application.bot.get_chat_history(
-                        chat_id=config['source_chat'],
-                        limit=100
-                    ):
-                        if message.message_id > last_msg_id:
-                            # Forward to destination channels
-                            for dest_chat in config['destination_chats']:
-                                try:
-                                    await self.forward_message(message, dest_chat, config)
-                                except Exception as e:
-                                    logger.error(f"Forward error: {e}")
-                            
-                            # Update last processed ID
-                            db.auto_forward.update_one(
-                                {'_id': config['_id']},
-                                {'$set': {'last_processed_id': message.message_id}}
-                            )
-                except Exception as e:
-                    logger.error(f"Auto-forward check error: {e}")
-        
-        # Run every 30 seconds
-        job_queue = self.application.job_queue
-        job_queue.run_repeating(check_and_forward, interval=30, first=10)
-    
-    async def forward_message(self, message, dest_chat: int, config: dict):
-        """Forward a single message with modifications"""
-        settings = {
-            'add_header': config.get('add_header', True),
-            'add_footer': config.get('add_footer', True),
-            'premium_frame': config.get('premium_frame', None),
-            'hide_as_spoiler': config.get('hide_as_spoiler', False),
-            'buttons': config.get('buttons', [])
-        }
-        
-        modified_text = None
-        if message.caption:
-            modified_text = MessageModifier.add_header_footer(
-                message.caption,
-                header=None if not settings['add_header'] else '',
-                footer=None if not settings['add_footer'] else ''
-            )
-        
-        text, reply_markup = MessageModifier.format_with_buttons(
-            modified_text or message.text or '',
-            settings.get('buttons')
-        )
-        
-        try:
-            if message.photo:
-                photo_file = await message.photo[-1].get_file()
-                photo_bytes = await photo_file.download_as_bytearray()
-                
-                if settings['premium_frame']:
-                    framed_image = PremiumEffects.add_frame_to_image(
-                        bytes(photo_bytes),
-                        settings['premium_frame']
-                    )
-                    await self.application.bot.send_photo(
-                        chat_id=dest_chat,
-                        photo=framed_image,
-                        caption=text if text else None,
-                        reply_markup=reply_markup,
-                        has_spoiler=settings['hide_as_spoiler']
-                    )
-                else:
-                    await self.application.bot.send_photo(
-                        chat_id=dest_chat,
-                        photo=message.photo[-1].file_id,
-                        caption=text if text else None,
-                        reply_markup=reply_markup,
-                        has_spoiler=settings['hide_as_spoiler']
-                    )
-            elif message.text:
-                await self.application.bot.send_message(
-                    chat_id=dest_chat,
-                    text=text or message.text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                await self.application.bot.forward_message(
-                    chat_id=dest_chat,
-                    from_chat_id=message.chat_id,
-                    message_id=message.message_id
-                )
-        except Exception as e:
-            logger.error(f"Message forwarding failed: {e}")
+# ============= HANDLERS =============
 
-class ScheduledPostManager:
-    def __init__(self, application: Application):
-        self.application = application
-        self.scheduler = AsyncIOScheduler()
-        
-    async def schedule_posts(self):
-        """Schedule all pending posts"""
-        posts = db.get_scheduled_posts('pending')
-        
-        for post in posts:
-            schedule_time = post['schedule_time']
-            if schedule_time > datetime.now():
-                self.scheduler.add_job(
-                    self.send_scheduled_post,
-                    'date',
-                    run_date=schedule_time,
-                    args=[post['_id']],
-                    id=str(post['_id'])
-                )
-        
-        self.scheduler.start()
-    
-    async def send_scheduled_post(self, post_id):
-        """Send a scheduled post"""
-        post = db.scheduled_posts.find_one({'_id': post_id})
-        if not post:
-            return
-        
-        try:
-            for chat_id in post['destination_chats']:
-                modified_text = MessageModifier.add_header_footer(
-                    post['content'],
-                    header=post.get('header'),
-                    footer=post.get('footer')
-                )
-                
-                text, reply_markup = MessageModifier.format_with_buttons(
-                    modified_text,
-                    post.get('buttons', [])
-                )
-                
-                if post.get('media_type') == 'photo':
-                    await self.application.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=post['media_id'],
-                        caption=text,
-                        reply_markup=reply_markup,
-                        parse_mode=ParseMode.HTML
-                    )
-                else:
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        reply_markup=reply_markup,
-                        parse_mode=ParseMode.HTML
-                    )
-            
-            # Mark as sent
-            db.update_scheduled_post(post_id, {'status': 'sent', 'sent_at': datetime.now()})
-        except Exception as e:
-            logger.error(f"Failed to send scheduled post: {e}")
-            db.update_scheduled_post(post_id, {'status': 'failed', 'error': str(e)})
-
-# Admin Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command"""
+    if not db:
+        await update.message.reply_text("❌ Database connection failed. Please try again later.")
+        return
+    
     user = update.effective_user
-    db.add_user(user.id, user.username)
+    db.add_user(user.id, user.username, user.first_name)
     
     is_admin = user.id in ADMIN_IDS
     
@@ -367,7 +136,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
         [InlineKeyboardButton("📝 Schedule Post", callback_data="schedule")],
-        [InlineKeyboardButton("🔄 Auto Forward", callback_data="auto_forward_menu")],
+        [InlineKeyboardButton("🔄 Auto Forward", callback_data="auto_forward")],
     ]
     
     if is_admin:
@@ -376,89 +145,158 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"Welcome {user.first_name}! 👋\n\n"
-        "I'm an advanced Telegram bot with powerful features:\n\n"
-        "✨ **Features:**\n"
-        "• Auto-forward posts between channels\n"
-        "• Schedule posts for later\n"
-        "• Premium frames for images\n"
-        "• Header/Footer system\n"
-        "• Spoiler hidden images\n"
-        "• Auto join request accept\n"
-        "• Inline buttons support\n\n"
-        "Use the buttons below to get started!",
+        f"✨ **Welcome {user.first_name}!** ✨\n\n"
+        f"🤖 **Advanced Telegram Modifier Bot**\n\n"
+        f"📊 **Users:** {db.get_user_count()}\n"
+        f"💾 **Database:** ✅ Connected\n\n"
+        f"**Features:**\n"
+        f"• Auto Forward Posts\n"
+        f"• Multi Channel Posting\n"
+        f"• Scheduled Posting\n"
+        f"• Premium Frames\n"
+        f"• Header/Footer System\n"
+        f"• Inline Buttons\n\n"
+        f"Use buttons below to get started!",
         reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode='Markdown'
     )
 
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dashboard callback"""
     query = update.callback_query
     await query.answer()
     
-    header = db.get_setting('header', 'Not set')
-    footer = db.get_setting('footer', 'Not set')
-    frame = db.get_setting('premium_frame', 'gold')
-    auto_approve = db.get_setting('auto_approve_requests', False)
-    delete_service = db.get_setting('delete_service_msgs', True)
+    if not db:
+        await query.edit_message_text("❌ Database not connected!")
+        return
     
-    keyboard = [
-        [InlineKeyboardButton("📝 Set Header", callback_data="set_header")],
-        [InlineKeyboardButton("📝 Set Footer", callback_data="set_footer")],
-        [InlineKeyboardButton(f"🖼️ Premium Frame: {frame.title()}", callback_data="change_frame")],
-        [InlineKeyboardButton(f"✅ Auto Approve: {'ON' if auto_approve else 'OFF'}", callback_data="toggle_auto_approve")],
-        [InlineKeyboardButton(f"🗑️ Delete Service Msgs: {'ON' if delete_service else 'OFF'}", callback_data="toggle_service_delete")],
-        [InlineKeyboardButton("◀️ Back", callback_data="main_menu")]
-    ]
+    total_users = db.get_user_count()
+    scheduled_count = db.scheduled_posts.count_documents({'status': 'pending'})
+    auto_forward_count = db.auto_forward.count_documents({'active': True})
     
-    text = f"**Bot Settings**\n\n"
-    text += f"**Header:** {header[:50]}...\n" if len(header) > 50 else f"**Header:** {header or 'Not set'}\n"
-    text += f"**Footer:** {footer[:50]}...\n" if len(footer) > 50 else f"**Footer:** {footer or 'Not set'}\n"
+    text = f"📊 **Dashboard**\n\n"
+    text += f"👥 **Total Users:** {total_users}\n"
+    text += f"📝 **Scheduled Posts:** {scheduled_count}\n"
+    text += f"🔄 **Auto-Forward Rules:** {auto_forward_count}\n"
+    text += f"🤖 **Bot Status:** 🟢 Online\n"
+    text += f"💾 **Database:** ✅ Connected\n"
+    
+    keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]]
     
     await query.edit_message_text(
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode='Markdown'
+    )
+
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Settings menu"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not db:
+        await query.edit_message_text("❌ Database not connected!")
+        return
+    
+    header = db.get_setting('header', 'Not set')
+    footer = db.get_setting('footer', 'Not set')
+    delete_service = db.get_setting('delete_service_msgs', True)
+    auto_approve = db.get_setting('auto_approve_requests', False)
+    
+    text = f"⚙️ **Bot Settings**\n\n"
+    text += f"📝 **Header:** {header[:30] if header else 'Not set'}...\n" if len(str(header)) > 30 else f"📝 **Header:** {header or 'Not set'}\n"
+    text += f"📝 **Footer:** {footer[:30] if footer else 'Not set'}...\n" if len(str(footer)) > 30 else f"📝 **Footer:** {footer or 'Not set'}\n"
+    text += f"🗑️ **Delete Service Msgs:** {'✅ ON' if delete_service else '❌ OFF'}\n"
+    text += f"✅ **Auto Approve Joins:** {'✅ ON' if auto_approve else '❌ OFF'}\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("📝 Set Header", callback_data="set_header")],
+        [InlineKeyboardButton("📝 Set Footer", callback_data="set_footer")],
+        [InlineKeyboardButton(f"🗑️ Service Messages", callback_data="toggle_service")],
+        [InlineKeyboardButton(f"✅ Auto Approve", callback_data="toggle_approve")],
+        [InlineKeyboardButton("◀️ Back", callback_data="main_menu")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
     )
 
 async def set_header(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set header"""
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_header'] = True
     
     await query.edit_message_text(
-        "Please send the header text you want to add to all messages.\n"
+        "📝 **Set Header**\n\n"
+        "Send the header text you want to add to all messages.\n\n"
         "Send /cancel to cancel.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancel", callback_data="settings")
-        ]])
+        ]]),
+        parse_mode='Markdown'
     )
 
 async def set_footer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set footer"""
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_footer'] = True
     
     await query.edit_message_text(
-        "Please send the footer text you want to add to all messages.\n"
+        "📝 **Set Footer**\n\n"
+        "Send the footer text you want to add to all messages.\n\n"
         "Send /cancel to cancel.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancel", callback_data="settings")
-        ]])
+        ]]),
+        parse_mode='Markdown'
     )
 
+async def toggle_service_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle service message deletion"""
+    query = update.callback_query
+    await query.answer()
+    
+    current = db.get_setting('delete_service_msgs', True)
+    db.update_setting('delete_service_msgs', not current)
+    
+    status = "ON" if not current else "OFF"
+    await query.edit_message_text(
+        f"✅ Service message deletion turned **{status}**!",
+        parse_mode='Markdown'
+    )
+    await settings_menu(update, context)
+
+async def toggle_auto_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle auto approve join requests"""
+    query = update.callback_query
+    await query.answer()
+    
+    current = db.get_setting('auto_approve_requests', False)
+    db.update_setting('auto_approve_requests', not current)
+    
+    status = "ON" if not current else "OFF"
+    await query.edit_message_text(
+        f"✅ Auto approve join requests turned **{status}**!",
+        parse_mode='Markdown'
+    )
+    await settings_menu(update, context)
+
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text input for settings"""
     if context.user_data.get('awaiting_header'):
         header = update.message.text
         db.update_setting('header', header)
         context.user_data.pop('awaiting_header')
         
         await update.message.reply_text(
-            f"✅ Header has been set successfully!\n\n"
-            f"**Header:** {header}",
-            parse_mode=ParseMode.MARKDOWN
+            f"✅ **Header has been set!**\n\n",
+            parse_mode='Markdown'
         )
         
-        # Show settings menu again
         keyboard = [[InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")]]
         await update.message.reply_text(
             "What would you like to do next?",
@@ -471,9 +309,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('awaiting_footer')
         
         await update.message.reply_text(
-            f"✅ Footer has been set successfully!\n\n"
-            f"**Footer:** {footer}",
-            parse_mode=ParseMode.MARKDOWN
+            f"✅ **Footer has been set!**\n\n",
+            parse_mode='Markdown'
         )
         
         keyboard = [[InlineKeyboardButton("⚙️ Back to Settings", callback_data="settings")]]
@@ -482,44 +319,186 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-async def change_frame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Schedule post menu"""
     query = update.callback_query
     await query.answer()
-    
-    keyboard = []
-    for frame_name in PREMIUM_FRAMES.keys():
-        keyboard.append([InlineKeyboardButton(
-            f"🎨 {frame_name.title()}",
-            callback_data=f"set_frame_{frame_name}"
-        )])
-    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="settings")])
     
     await query.edit_message_text(
-        "**Select Premium Frame Style:**\n\n"
-        "Choose a frame to apply to all outgoing images:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
+        "📝 **Schedule Post**\n\n"
+        "Feature coming soon!\n\n"
+        "This will allow you to:\n"
+        "• Schedule messages for future\n"
+        "• Set multiple destinations\n"
+        "• Add headers/footers\n"
+        "• Add inline buttons",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Back", callback_data="main_menu")
+        ]]),
+        parse_mode='Markdown'
     )
 
-async def set_frame_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    frame = query.data.replace('set_frame_', '')
-    
-    if frame in PREMIUM_FRAMES:
-        db.update_setting('premium_frame', frame)
-        await query.answer(f"✅ {frame.title()} frame activated!")
-        
-        # Show settings menu
-        await settings_menu(update, context)
-
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def auto_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto forward menu"""
     query = update.callback_query
     await query.answer()
     
-    total_users = db.users.count_documents({})
-    scheduled_count = db.scheduled_posts.count_documents({'status': 'pending'})
-    auto_forward_count = db.auto_forward.count_documents({'active': True})
+    await query.edit_message_text(
+        "🔄 **Auto Forward**\n\n"
+        "Feature coming soon!\n\n"
+        "This will allow you to:\n"
+        "• Auto-forward from source channels\n"
+        "• Forward to multiple destinations\n"
+        "• Add custom modifications\n"
+        "• Apply premium frames",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Back", callback_data="main_menu")
+        ]]),
+        parse_mode='Markdown'
+    )
+
+async def user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User statistics for admin"""
+    query = update.callback_query
+    await query.answer()
+    
+    if update.effective_user.id not in ADMIN_IDS:
+        await query.edit_message_text("❌ **Admin only command!**", parse_mode='Markdown')
+        return
+    
+    if not db:
+        await query.edit_message_text("❌ Database not connected!")
+        return
+    
+    total_users = db.get_user_count()
+    
+    # Get recent users
+    recent_users = list(db.users.find().sort('last_active', -1).limit(10))
+    
+    text = f"👥 **User Statistics**\n\n"
+    text += f"📊 **Total Users:** {total_users}\n\n"
+    text += f"🆕 **Recent Users:**\n"
+    
+    for user in recent_users:
+        name = user.get('first_name', 'Unknown')
+        username = user.get('username', 'no_username')
+        last_active = user.get('last_active', datetime.now()).strftime('%Y-%m-%d')
+        text += f"• {name} (@{username}) - {last_active}\n"
+    
+    keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]]
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return to main menu"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    is_admin = user.id in ADMIN_IDS
     
     keyboard = [
-        [InlineKeyboardButton("📅 View Scheduled Posts", callback_data="view_scheduled")],
-        [InlineKeyboardBu
+        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+        [InlineKeyboardButton("📝 Schedule Post", callback_data="schedule")],
+        [InlineKeyboardButton("🔄 Auto Forward", callback_data="auto_forward")],
+    ]
+    
+    if is_admin:
+        keyboard.append([InlineKeyboardButton("👥 User Stats", callback_data="user_stats")])
+    
+    await query.edit_message_text(
+        f"✨ **Main Menu** ✨\n\nChoose an option:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel current operation"""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "❌ Operation cancelled!",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Back to Menu", callback_data="main_menu")
+        ]])
+    )
+
+async def handle_service_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete service messages if enabled"""
+    if not db:
+        return
+    
+    delete_service = db.get_setting('delete_service_msgs', True)
+    
+    if delete_service and update.message:
+        if update.message.new_chat_members or update.message.left_chat_member:
+            try:
+                await update.message.delete()
+            except:
+                pass
+
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto approve join requests"""
+    if not db:
+        return
+    
+    auto_approve = db.get_setting('auto_approve_requests', False)
+    
+    if auto_approve and update.chat_join_request:
+        try:
+            await update.chat_join_request.approve()
+            logger.info(f"Approved join request from {update.effective_user.id}")
+        except Exception as e:
+            logger.error(f"Failed to approve join request: {e}")
+
+# ============= MAIN =============
+
+def main():
+    """Start the bot"""
+    if not BOT_TOKEN:
+        logger.error("No BOT_TOKEN provided!")
+        return
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("cancel", cancel))
+    
+    # Callback handlers
+    application.add_handler(CallbackQueryHandler(dashboard, pattern='^dashboard$'))
+    application.add_handler(CallbackQueryHandler(settings_menu, pattern='^settings$'))
+    application.add_handler(CallbackQueryHandler(main_menu, pattern='^main_menu$'))
+    application.add_handler(CallbackQueryHandler(user_stats, pattern='^user_stats$'))
+    application.add_handler(CallbackQueryHandler(set_header, pattern='^set_header$'))
+    application.add_handler(CallbackQueryHandler(set_footer, pattern='^set_footer$'))
+    application.add_handler(CallbackQueryHandler(schedule_post, pattern='^schedule$'))
+    application.add_handler(CallbackQueryHandler(auto_forward, pattern='^auto_forward$'))
+    application.add_handler(CallbackQueryHandler(toggle_service_messages, pattern='^toggle_service$'))
+    application.add_handler(CallbackQueryHandler(toggle_auto_approve, pattern='^toggle_approve$'))
+    
+    # Message handlers
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_service_messages))
+    application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, handle_service_messages))
+    application.add_handler(MessageHandler(filters.StatusUpdate.CHAT_JOIN_REQUEST, handle_join_request))
+    
+    # Error handler
+    async def error_handler(update, context):
+        logger.error(f"Update {update} caused error {context.error}")
+    
+    application.add_error_handler(error_handler)
+    
+    # Start bot
+    logger.info("🚀 Bot started successfully!")
+    print("✅ Bot is running... Press Ctrl+C to stop")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
